@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "dlt>=1.23.0",
+    "kafka-python>=2.3.0",
     "pandas>=3.0.1",
     "psycopg[binary]>=3.3.3",
     "pydantic>=2.12.5",
