@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 
+# Default connection settings assume the local Step 6 Docker Compose stack.
 DEFAULT_FLINK_REST_HOST = "localhost"
 DEFAULT_FLINK_REST_PORT = 8081
 
@@ -24,6 +25,7 @@ DEFAULT_POSTGRES_PORT = 5432
 DEFAULT_SINK_TABLE = "stream_hourly_lmp"
 
 
+# Lazy import so the script can fail with a targeted message if psycopg is missing.
 def load_psycopg() -> Any:
     try:
         return importlib.import_module("psycopg")
@@ -34,6 +36,7 @@ def load_psycopg() -> Any:
         ) from exc
 
 
+    # Lazy import so normal repo work does not require PyFlink until Step 8.
 def load_pyflink_table() -> tuple[Any, Any]:
     try:
         pyflink_table = importlib.import_module("pyflink.table")
@@ -46,6 +49,7 @@ def load_pyflink_table() -> tuple[Any, Any]:
     return pyflink_table.EnvironmentSettings, pyflink_table.TableEnvironment
 
 
+# Resolve paths relative to the repo so the script works from any current directory.
 def repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
@@ -54,6 +58,7 @@ def default_jars_dir() -> Path:
     return repo_root() / "ops" / "flink" / "jars"
 
 
+# CLI flags let the same job target local Docker Compose or another compatible stack.
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="PyFlink job: windowed LMP aggregation from Redpanda to Postgres."
@@ -107,6 +112,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# Fail fast if the Kafka and JDBC connector jars are not present for Step 8.
 def require_jars(jars_dir: Path) -> list[Path]:
     if not jars_dir.exists():
         raise FileNotFoundError(
@@ -137,6 +143,7 @@ def require_jars(jars_dir: Path) -> list[Path]:
     return jar_paths
 
 
+# Create a clean sink table before submission when running host-side setup.
 def init_postgres_sink_table(
     *,
     sink_table: str,
@@ -171,16 +178,20 @@ def init_postgres_sink_table(
             cur.execute(create_sql)
 
 
+# Main flow: validate inputs, configure remote Flink, register tables, submit query.
 def main() -> None:
     args = parse_args()
     EnvironmentSettings, TableEnvironment = load_pyflink_table()
 
+    # Tumbling windows must have a positive size.
     if args.window_size_minutes <= 0:
         raise ValueError("--window-size-minutes must be > 0")
 
+    # Flink needs the Kafka connector, JDBC connector, and Postgres driver on its classpath.
     jar_paths = require_jars(args.jars_dir)
     pipeline_jars = ";".join(f"file://{p}" for p in jar_paths)
 
+    # Optional host-side table creation is useful before the remote job starts writing.
     if args.init_postgres_from_host:
         init_postgres_sink_table(
             sink_table=args.sink_table,
@@ -189,9 +200,11 @@ def main() -> None:
             postgres_password=args.postgres_password,
         )
 
+    # Submit to the remote JobManager exposed by the local Flink container.
     settings = EnvironmentSettings.in_streaming_mode()
     t_env = TableEnvironment.create(settings)
 
+    # Register the remote target and attach the connector jars to the pipeline.
     config = t_env.get_config().get_configuration()
     config.set_string("execution.target", "remote")
     config.set_string("rest.address", args.flink_rest_host)
@@ -199,8 +212,15 @@ def main() -> None:
     config.set_string("pipeline.jars", pipeline_jars)
     config.set_string("parallelism.default", "1")
 
-    # Kafka source: values are JSON dictionaries produced by replay_day_ahead.py.
-    # Keep fields as STRING and cast where needed.
+    # Kafka source DDL.
+    # replay_day_ahead.py publishes each normalized CSV row as a flat JSON object,
+    # so the Flink source table mirrors those JSON keys directly.
+    #
+    # We intentionally ingest the timestamp and numeric payload as STRING values at
+    # the source boundary because that matches the wire format exactly and avoids
+    # rejecting whole records when a single value is malformed. event_time is then
+    # derived from market_timestamp_utc for event-time windowing, and lmp_total is
+    # cast only inside the aggregation query where Flink needs numeric semantics.
     source_ddl = f"""
     CREATE TABLE day_ahead_events (
       market_timestamp_utc STRING,
@@ -247,8 +267,17 @@ def main() -> None:
     t_env.execute_sql(source_ddl)
     t_env.execute_sql(sink_ddl)
 
+    # Keep the SQL interval string derived from the CLI so Step 8 can change window size.
     window_interval = f"INTERVAL '{args.window_size_minutes}' MINUTE"
 
+    # Tumbling-window insert query.
+    # TABLE(TUMBLE(...)) turns the unbounded Kafka event stream into fixed-size,
+    # non-overlapping event-time windows. Each output row represents one location
+    # within one window, carrying the window bounds plus simple aggregate metrics.
+    #
+    # Because lmp_total arrives as STRING from JSON, the query casts it to DOUBLE
+    # at aggregation time for AVG/MAX while COUNT(*) preserves the raw row volume
+    # seen in that window.
     insert_sql = f"""
     INSERT INTO {args.sink_table}
     SELECT
@@ -272,7 +301,7 @@ def main() -> None:
         f"sink_table={args.sink_table} window_minutes={args.window_size_minutes}"
     )
 
-    # This returns immediately with a JobClient; the job keeps running.
+    # execute_sql submits the streaming insert and returns while the job continues remotely.
     t_env.execute_sql(insert_sql)
 
     print(
